@@ -24,3 +24,13 @@
 ### Add a new contract
 
 `npx blueprint create ContractName` or `yarn blueprint create ContractName`
+
+
+### Testnet Deployment
+
+#### Sent transaction
+- Contract deployed at address EQCMNmYtHrCBHNDIWF066SftMwavL6dHagTTyEipytmt7T6Q
+- You can view it at https://testnet.tonscan.org/address/EQCMNmYtHrCBHNDIWF066SftMwavL6dHagTTyEipytmt7T6Q
+- Admin address: EQDA05Tm0K37K9KO5VFp3V7ZmVDIYBCi2_4A9OWr5SGtZdtn
+- Initial ROI multiplier: 10000
+- Next halving time: 2025-01-13T03:46:35.000Z
