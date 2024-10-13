@@ -1,0 +1,832 @@
+#include "imports/stdlib.fc";
+#include "imports/params.fc";
+
+;; Storage variables
+global int ctx_total_supply;
+global cell ctx_users;
+global cell ctx_config;
+global slice ctx_admin_address;
+global int ctx_roi_multiplier;
+global int ctx_daily_withdrawn; ;; Track daily withdrawals
+global int ctx_last_withdrawal_reset; ;; Last time daily withdrawal was reset
+global int ctx_next_halving_time;
+global int ctx_halving_count;
+global int ctx_sustainability_pool;
+global cell ctx_code;
+
+
+
+;; User structure
+;; address: MsgAddress
+;; upline: MsgAddress
+;; investment_plan: int (0: None, 1: Basic, 2: Intermediate, 3: Advanced)
+;; total_invested: int
+;; total_withdrawn: int
+;; last_investment_time: int
+;; referral_earnings: int
+;; total_earnings: int (including investments and referrals)
+
+
+
+
+;; Constants
+const int TON = 1000000000; ;; 1 TON in nanoTONs
+const int BASIS_POINTS = 10000; ;; 100% in basis points
+
+;; Investment Plan structure
+const int PLAN_BASIC = 0;
+const int PLAN_INTERMEDIATE = 1;
+const int PLAN_ADVANCED = 2;
+
+
+
+
+;; Constants for referral system
+const int REFERRAL_LEVELS = 3;
+const int MAX_ROI_PERCENTAGE = 300;
+
+
+;; Constants for withdrawal system
+const int MIN_WITHDRAWAL = 1 * TON;
+const int DAILY_WITHDRAWAL_LIMIT = 100 * TON;
+
+
+
+
+;; Constants for reinvestment
+const int MAX_ROI_PERCENTAGE = 300;
+
+
+
+
+;; Logs storage variables
+global cell ctx_logs;
+const int MAX_LOGS = 100;
+global int ctx_log_count;
+
+
+
+
+;; Constants for event types
+const int EVENT_INVEST = 1;
+const int EVENT_WITHDRAW = 2;
+const int EVENT_REINVEST = 3;
+
+
+
+
+;; Load storage variables 
+() load_data() impure inline {
+    var ds = get_data().begin_parse();
+    ctx_total_supply = ds~load_uint(64);
+    ctx_users = ds~load_dict();
+    ctx_config = ds~load_dict();
+    ctx_admin_address = ds~load_msg_addr();
+    ctx_roi_multiplier = ds~load_uint(16);
+    ctx_daily_withdrawn = ds~load_coins();
+    ctx_last_withdrawal_reset = ds~load_uint(32);
+    ctx_next_halving_time = ds~load_uint(32);
+    ctx_halving_count = ds~load_uint(8);
+    ctx_sustainability_pool = ds~load_coins();
+    ctx_code = ds~load_ref();
+    ctx_logs = ds~load_dict();
+    ctx_log_count = ds~load_uint(32);
+}
+
+
+;; Save storage variable
+() save_data() impure inline {
+    set_data(begin_cell()
+        .store_uint(ctx_total_supply, 64)
+        .store_dict(ctx_users)
+        .store_dict(ctx_config)
+        .store_slice(ctx_admin_address)
+        .store_uint(ctx_roi_multiplier, 16)
+        .store_coins(ctx_daily_withdrawn)
+        .store_uint(ctx_last_withdrawal_reset, 32)
+        .store_uint(ctx_next_halving_time, 32)
+        .store_uint(ctx_halving_count, 8)
+        .store_coins(ctx_sustainability_pool)
+        .store_ref(ctx_code)
+        .store_dict(ctx_logs)
+        .store_uint(ctx_log_count, 32)
+    .end_cell());
+}
+
+
+;; Function to log events
+() log_event(int event_type, slice user_address, int amount) impure {
+    slice log_data = begin_cell()
+        .store_uint(event_type, 8)
+        .store_slice(user_address)
+        .store_coins(amount)
+    .end_cell().begin_parse();
+    
+    ctx_logs~udict_set(32, ctx_log_count, log_data);
+    ctx_log_count += 1;
+    
+    ;; Remove oldest log if we've exceeded MAX_LOGS
+    if (ctx_log_count > MAX_LOGS) {
+        ctx_logs~udict_delete?(32, ctx_log_count - MAX_LOGS - 1);
+    }
+}
+
+
+
+;; Contract upgrade function
+() upgrade_contract(cell new_code, slice sender_address) impure {
+    load_data();
+    throw_unless(error::unauthorized(), equal_slices(sender_address, ctx_admin_address));
+    set_code(new_code);
+    ctx_code = new_code;
+    save_data();
+}
+
+
+;; Getter for admin address
+slice get_admin_address() method_id {
+    load_data();
+    return ctx_admin_address;
+}
+
+;; Function to update admin address (only callable by current admin)
+() update_admin_address(slice new_admin_address, slice sender_address) impure {
+    load_data();
+    throw_unless(error::unauthorized(), equal_slices(sender_address, ctx_admin_address));
+    ctx_admin_address = new_admin_address;
+    save_data();
+}
+
+;; Admin functions
+() set_config(cell new_config, slice sender_address) impure {
+    load_data();
+    throw_unless(error::unauthorized(), equal_slices(sender_address, ctx_admin_address));
+    ctx_config = new_config;
+    save_data();
+}
+
+
+
+;; Init function for contract deployment
+() recv_external(slice in_msg) impure {
+    ;; This function is called once during contract deployment
+    ;; It should set the initial admin address and ROI multiplier
+    throw_if(35, in_msg.slice_bits() != 267);
+    slice initial_admin_address = in_msg~load_msg_addr();
+    set_data(begin_cell()
+        .store_uint(0, 64)  ;; Initial total supply
+        .store_dict(new_dict())  ;; Empty users dict
+        .store_dict(new_dict())  ;; Empty config dict
+        .store_slice(initial_admin_address)  ;; Set initial admin address
+        .store_uint(BASIS_POINTS, 16)  ;; Initial ROI multiplier (100%)
+        .store_uint(now() + 7889238, 32)  ;; Set initial next halving time (3 months from deployment)
+        .store_uint(0, 8)  ;; Initial halving count
+    .end_cell());
+}
+
+
+
+
+
+
+;; Helper function to convert address to 256-bit integer
+int address_to_uint256(slice address) inline {
+    (int wc, int addr_hash) = parse_std_addr(address);
+    return addr_hash;
+}
+
+;; User registration function
+() register_user(slice user_address, slice upline_address) impure {
+    load_data();
+    
+    int user_key = address_to_uint256(user_address);
+    int upline_key = address_to_uint256(upline_address);
+    
+    ;; Check if user already exists
+    (_, int user_exists) = ctx_users.udict_get?(256, user_key);
+    throw_if(error::user_already_registered(), user_exists);
+    
+    ;; Check if upline exists (except for admin registration)
+    if (~ equal_slices(upline_address, ctx_admin_address)) {
+        (_, int upline_exists) = ctx_users.udict_get?(256, upline_key);
+        throw_unless(error::invalid_upline(), upline_exists);
+    }
+    
+    ;; Create new user entry
+    slice user_data = begin_cell()
+        .store_slice(user_address)  ;; Store full address
+        .store_slice(upline_address)
+        .store_uint(0, 2)  ;; investment_plan (0: None)
+        .store_coins(0)    ;; total_invested
+        .store_coins(0)    ;; total_withdrawn
+        .store_uint(now(), 32)  ;; last_investment_time
+    .end_cell().begin_parse();
+    
+    ;; Add user to users dictionary
+    ctx_users~udict_set(256, user_key, user_data);
+    
+    save_data();
+}
+
+
+
+
+
+
+
+;; Function to get investment plan details
+(int, int, int, int) get_plan_details(int plan_id) inline {
+    if (plan_id == PLAN_BASIC) {
+        return (10, 2 * TON, 200, 5); ;; 1% daily ROI, 2 TON min, 200 days, 5% fee
+    } elseif (plan_id == PLAN_INTERMEDIATE) {
+        return (15, 20 * TON, 250, 3); ;; 1.5% daily ROI, 20 TON min, 250 days, 3% fee
+    } elseif (plan_id == PLAN_ADVANCED) {
+        return (20, 200 * TON, 300, 2); ;; 2% daily ROI, 200 TON min, 300 days, 2% fee
+    } else {
+        return (0, 0, 0, 0); ;; Invalid plan
+    }
+}
+
+
+;; Function to calculate referral commission
+int calculate_referral_commission(int level, int amount) inline {
+    if (level == 0) {
+        return (amount * 1000) / 10000; ;; 10% for level 1
+    } elseif (level == 1) {
+        return (amount * 500) / 10000;  ;; 5% for level 2
+    } elseif (level == 2) {
+        return (amount * 200) / 10000;  ;; 2% for level 3
+    } else {
+        return 0;
+    }
+}
+
+
+
+
+
+;; Function to distribute referral commission
+() distribute_referral_commission(slice referrer_address, int level, int amount) impure {
+    int referrer_key = address_to_uint256(referrer_address);
+    (slice referrer_data, int found?) = ctx_users.udict_get?(256, referrer_key);
+    if (found?) {
+        slice ds = referrer_data;
+        slice stored_address = ds~load_msg_addr();
+        slice upline = ds~load_msg_addr();
+        int investment_plan = ds~load_uint(2);
+        int total_invested = ds~load_coins();
+        int total_withdrawn = ds~load_coins();
+        int last_investment_time = ds~load_uint(32);
+        int referral_earnings = ds~load_coins();
+        int total_earnings = ds~load_coins();
+
+        int commission = calculate_referral_commission(level, amount);
+        
+        ;; Add 2% bonus on downline earnings
+        if (level == 0) {
+            int bonus = (amount * 200) / 10000; ;; 2% bonus
+            commission += bonus;
+        }
+        
+        referral_earnings += commission;
+        total_earnings += commission;
+
+        ;; Check if total earnings exceed 300% of total invested
+        if (total_earnings <= (total_invested * 3)) {
+            slice new_referrer_data = begin_cell()
+                .store_slice(stored_address)
+                .store_slice(upline)
+                .store_uint(investment_plan, 2)
+                .store_coins(total_invested)
+                .store_coins(total_withdrawn)
+                .store_uint(last_investment_time, 32)
+                .store_coins(referral_earnings)
+                .store_coins(total_earnings)
+            .end_cell().begin_parse();
+
+            ctx_users~udict_set(256, referrer_key, new_referrer_data);
+
+            ;; Distribute to upline if not reached level 3
+            if (level < 2) {
+                distribute_referral_commission(upline, level + 1, amount);
+            }
+        }
+    }
+}
+
+
+
+;; Function to check if reinvestment is required
+int is_reinvestment_required(int total_invested, int total_earnings) inline {
+    return total_earnings >= (total_invested * 3);
+}
+
+
+
+;; Function to reinvest
+() reinvest(slice user_address) impure {
+    int user_key = address_to_uint256(user_address);
+    (slice user_data, int found?) = ctx_users.udict_get?(256, user_key);
+    throw_unless(error::user_not_found(), found?);
+
+    slice ds = user_data;
+    slice stored_address = ds~load_msg_addr();
+    slice upline = ds~load_msg_addr();
+    int current_plan = ds~load_uint(2);
+    int total_invested = ds~load_coins();
+    int total_withdrawn = ds~load_coins();
+    int last_investment_time = ds~load_uint(32);
+    int referral_earnings = ds~load_coins();
+    int total_earnings = ds~load_coins();
+
+    int reinvestment_amount = total_earnings - total_withdrawn;
+    
+    ;; Reset investment data
+    total_invested += reinvestment_amount;
+    total_withdrawn = 0;
+    total_earnings = reinvestment_amount;
+    last_investment_time = now();
+
+    ;; Update user data
+    slice new_user_data = begin_cell()
+        .store_slice(stored_address)
+        .store_slice(upline)
+        .store_uint(current_plan, 2)
+        .store_coins(total_invested)
+        .store_coins(total_withdrawn)
+        .store_uint(last_investment_time, 32)
+        .store_coins(referral_earnings)
+        .store_coins(total_earnings)
+    .end_cell().begin_parse();
+
+    ctx_users~udict_set(256, user_key, new_user_data);
+    
+    save_data();
+}
+
+
+
+() check_and_apply_roi_halving() impure {
+    int current_time = now();
+    if (current_time >= ctx_next_halving_time) {
+        ;; Apply ROI halving
+        if (ctx_halving_count == 0) {
+            ctx_roi_multiplier = (ctx_roi_multiplier * 200) / 250; ;; 2.5% to 2.0%
+        } elseif (ctx_halving_count == 1) {
+            ctx_roi_multiplier = (ctx_roi_multiplier * 175) / 200; ;; 2.0% to 1.75%
+        } elseif (ctx_halving_count == 2) {
+            ctx_roi_multiplier = (ctx_roi_multiplier * 150) / 175; ;; 1.75% to 1.5%
+        } elseif (ctx_halving_count == 3) {
+            ctx_roi_multiplier = (ctx_roi_multiplier * 125) / 150; ;; 1.5% to 1.25%
+        } else {
+            ctx_roi_multiplier = (ctx_roi_multiplier * 95) / 100; ;; 5% reduction for subsequent halvings
+        }
+
+        ctx_halving_count += 1;
+        ctx_next_halving_time = current_time + 7889238; ;; Approximately 3 months (91.31 days)
+        save_data();
+    }
+}
+
+
+
+
+
+
+;; Function to invest in a plan
+() invest(slice user_address, int plan_id, int amount) impure {
+    load_data();
+    check_and_apply_roi_halving();
+    int user_key = address_to_uint256(user_address);
+    (slice user_data, int found?) = ctx_users.udict_get?(256, user_key);
+
+
+    if (found?) {
+        slice ds = user_data;
+        ds~load_msg_addr(); ;; skip stored_address
+        ds~load_msg_addr(); ;; skip upline
+        ds~load_uint(2); ;; skip current_plan
+        int total_invested = ds~load_coins();
+        int total_withdrawn = ds~load_coins();
+        ds~load_uint(32); ;; skip last_investment_time
+        ds~load_coins(); ;; skip referral_earnings
+        int total_earnings = ds~load_coins();
+
+        ;; Check if reinvestment is required
+        if (is_reinvestment_required(total_invested, total_earnings)) {
+            reinvest(user_address);
+        }
+    }
+
+
+
+
+
+    throw_unless(error::user_not_found(), found?);
+
+    (int daily_roi, int min_investment, int duration, int withdrawal_fee) = get_plan_details(plan_id);
+    throw_unless(error::invalid_plan(), daily_roi != 0);
+    throw_unless(error::insufficient_investment(), amount >= min_investment);
+
+    slice ds = user_data;
+    slice stored_address = ds~load_msg_addr();
+    slice upline = ds~load_msg_addr();
+    int current_plan = ds~load_uint(2);
+    int total_invested = ds~load_coins();
+    int total_withdrawn = ds~load_coins();
+    int last_investment_time = ds~load_uint(32);
+    int referral_earnings = ds~load_coins();
+    int total_earnings = ds~load_coins();
+
+    ;; Update user data
+    total_invested += amount;
+    total_earnings += amount;
+    last_investment_time = now();
+
+    slice new_user_data = begin_cell()
+        .store_slice(stored_address)
+        .store_slice(upline)
+        .store_uint(plan_id, 2)
+        .store_coins(total_invested)
+        .store_coins(total_withdrawn)
+        .store_uint(last_investment_time, 32)
+        .store_coins(referral_earnings)
+        .store_coins(total_earnings)
+    .end_cell().begin_parse();
+
+    ctx_users~udict_set(256, user_key, new_user_data);
+    ctx_total_supply += amount;
+
+    ;; Distribute referral commission
+    distribute_referral_commission(upline, 0, amount);
+
+    ;; Log the investment event
+    log_event(EVENT_INVEST, user_address, amount);
+    
+    save_data();
+}
+
+
+
+;; Function to calculate daily ROI with multiplier
+int calculate_daily_roi(int plan_id, int invested_amount) inline {
+    (int daily_roi_basis_points, _, _, _) = get_plan_details(plan_id);
+    return (invested_amount * daily_roi_basis_points * ctx_roi_multiplier) / (BASIS_POINTS * BASIS_POINTS);
+}
+
+;; Admin function to halve ROI for all plans
+() admin_halve_roi(slice sender_address) impure {
+    load_data();
+    throw_unless(error::unauthorized(), equal_slices(sender_address, ctx_admin_address));
+    
+    ;; Halve the ROI multiplier
+    ctx_roi_multiplier = ctx_roi_multiplier / 2;
+    
+    save_data();
+}
+
+
+;; Function to distribute ROI
+() distribute_roi(slice user_address) impure {
+    load_data();
+    check_and_apply_roi_halving();
+    int user_key = address_to_uint256(user_address);
+    (slice user_data, int found?) = ctx_users.udict_get?(256, user_key);
+    throw_unless(error::user_not_found(), found?);
+
+    slice ds = user_data;
+    slice stored_address = ds~load_msg_addr();
+    slice upline = ds~load_msg_addr();
+    int current_plan = ds~load_uint(2);
+    int total_invested = ds~load_coins();
+    int total_withdrawn = ds~load_coins();
+    int last_investment_time = ds~load_uint(32);
+    int referral_earnings = ds~load_coins();
+    int total_earnings = ds~load_coins();
+
+    int current_time = now();
+    int days_since_last_roi = (current_time - last_investment_time) / 86400; ;; 86400 seconds in a day
+
+    if (days_since_last_roi > 0) {
+        int daily_roi = calculate_daily_roi(current_plan, total_invested);
+        int total_roi = daily_roi * days_since_last_roi;
+
+        ;; ;; Apply ROI halving (example: halve ROI every 180 days)
+        ;; int days_since_start = (current_time - last_investment_time) / 86400;
+        ;; int halving_periods = days_since_start / 180;
+        ;; repeat (halving_periods) {
+        ;;     total_roi = total_roi / 2;
+        ;; }
+
+        total_earnings += total_roi;
+
+        ;; Check if reinvestment is required
+        if (is_reinvestment_required(total_invested, total_earnings)) {
+            reinvest(user_address);
+        } else {
+            ;; Update user data
+            slice new_user_data = begin_cell()
+                .store_slice(stored_address)
+                .store_slice(upline)
+                .store_uint(current_plan, 2)
+                .store_coins(total_invested)
+                .store_coins(total_withdrawn)
+                .store_uint(current_time, 32)
+                .store_coins(referral_earnings)
+                .store_coins(total_earnings)
+            .end_cell().begin_parse();
+
+            ctx_users~udict_set(256, user_key, new_user_data);
+            ctx_total_supply += total_roi;
+        }
+    }
+
+    save_data();
+}
+
+
+
+
+;; Function to trigger ROI distribution for all users
+() distribute_roi_all_users() impure {
+    load_data();
+    int key = -1;
+    do {
+        (key, slice cs, int f) = ctx_users.udict_get_next?(256, key);
+        if (f) {
+            slice user_address = cs~load_msg_addr();
+            distribute_roi(user_address);
+        }
+    } until (~ f);
+    save_data();
+}
+
+
+;; Function to reset daily withdrawal limit
+() reset_daily_withdrawal() impure inline {
+    int current_time = now();
+    if (current_time - ctx_last_withdrawal_reset >= 86400) {
+        ctx_daily_withdrawn = 0;
+        ctx_last_withdrawal_reset = current_time;
+    }
+}
+
+
+
+
+
+;; Function to get withdrawal waiting period
+int get_withdrawal_waiting_period(int plan_id) inline {
+    if (plan_id == PLAN_BASIC) {
+        return 7 * 86400; ;; 7 days in seconds
+    } elseif (plan_id == PLAN_INTERMEDIATE) {
+        return 15 * 86400; ;; 15 days in seconds
+    } elseif (plan_id == PLAN_ADVANCED) {
+        return 30 * 86400; ;; 30 days in seconds
+    } else {
+        return 0; ;; Invalid plan
+    }
+}
+
+
+
+;; Function to process withdrawal
+() process_withdrawal(slice user_address, int amount, int query_id) impure {
+    load_data();
+    check_and_apply_roi_halving();
+    reset_daily_withdrawal();
+    throw_unless(error::insufficient_funds(), amount >= MIN_WITHDRAWAL);
+    throw_unless(error::exceeds_daily_limit(), ctx_daily_withdrawn + amount <= DAILY_WITHDRAWAL_LIMIT);
+
+    int user_key = address_to_uint256(user_address);
+    (slice user_data, int found?) = ctx_users.udict_get?(256, user_key);
+    throw_unless(error::user_not_found(), found?);
+
+    slice ds = user_data;
+    slice stored_address = ds~load_msg_addr();
+    slice upline = ds~load_msg_addr();
+    int investment_plan = ds~load_uint(2);
+    int total_invested = ds~load_coins();
+    int total_withdrawn = ds~load_coins();
+    int last_investment_time = ds~load_uint(32);
+    int referral_earnings = ds~load_coins();
+    int total_earnings = ds~load_coins();
+
+    ;; Check withdrawal waiting period
+    int waiting_period = get_withdrawal_waiting_period(investment_plan);
+    throw_unless(error::withdrawal_too_early(), now() - last_investment_time >= waiting_period);
+
+    (_, _, _, int withdrawal_fee) = get_plan_details(investment_plan);
+    int fee_amount = (amount * withdrawal_fee) / 100;
+    int sustainability_fee = fee_amount / 2; ;; 50% of the fee goes to sustainability pool
+    int withdrawal_amount = amount - fee_amount;
+
+    throw_unless(error::insufficient_balance(), total_earnings - total_withdrawn >= amount);
+
+    total_withdrawn += amount;
+    ctx_daily_withdrawn += amount;
+    ctx_total_supply -= withdrawal_amount;
+    ctx_sustainability_pool += sustainability_fee;
+
+    ;; Update user data
+    slice new_user_data = begin_cell()
+        .store_slice(stored_address)
+        .store_slice(upline)
+        .store_uint(investment_plan, 2)
+        .store_coins(total_invested)
+        .store_coins(total_withdrawn)
+        .store_uint(last_investment_time, 32)
+        .store_coins(referral_earnings)
+        .store_coins(total_earnings)
+    .end_cell().begin_parse();
+
+    ctx_users~udict_set(256, user_key, new_user_data);
+
+    ;; Send withdrawal to user
+    var msg = begin_cell()
+        .store_uint(0x10, 6) ;; nobounce - int_msg_info$0 ihr_disabled:Bool bounce:Bool bounced:Bool src:MsgAddress -> 011000
+        .store_slice(user_address)
+        .store_coins(withdrawal_amount)
+        .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+        .store_uint(op::withdrawal_processed(), 32)
+        .store_uint(query_id, 64);
+    send_raw_message(msg.end_cell(), 1); ;; pay transfer fees separately, revert on errors
+
+    ;; Log the withdrawal event
+    log_event(EVENT_WITHDRAW, user_address, withdrawal_amount);
+
+    save_data();
+}
+
+
+
+
+
+
+;; Main entry point
+() recv_internal(int msg_value, cell in_msg_full, slice in_msg_body) impure {
+    if (in_msg_body.slice_empty?()) { ;; ignore empty messages
+        return ();
+    }
+    slice cs = in_msg_full.begin_parse();
+    int flags = cs~load_uint(4);
+    if (flags & 1) { ;; ignore all bounced messages
+        return ();
+    }
+    slice sender_address = cs~load_msg_addr();
+    load_data();
+    int op = in_msg_body~load_uint(32);
+    int query_id = in_msg_body~load_uint(64);
+    
+    if (op == op::register_user()) {
+        slice upline_address = in_msg_body~load_msg_addr();
+        register_user(sender_address, upline_address);
+    } elseif (op == op::update_admin()) {
+        slice new_admin_address = in_msg_body~load_msg_addr();
+        update_admin_address(new_admin_address, sender_address);
+    } elseif (op == op::invest()) {
+        int plan_id = in_msg_body~load_uint(2);
+        invest(sender_address, plan_id, msg_value);
+    } elseif (op == op::distribute_roi()) {
+        distribute_roi(sender_address);
+    } elseif (op == op::distribute_roi_all()) {
+        throw_unless(error::unauthorized(), equal_slices(sender_address, ctx_admin_address));
+        distribute_roi_all_users();
+    } elseif (op == op::halve_roi()) {
+        admin_halve_roi(sender_address);
+    } elseif (op == op::withdraw()) {
+        int amount = in_msg_body~load_coins();
+        process_withdrawal(sender_address, amount, query_id);
+    } elseif (op == op::reinvest()) {
+        reinvest(sender_address);
+    } elseif (op == op::upgrade_contract()) {
+        cell new_code = in_msg_body~load_ref();
+        upgrade_contract(new_code, sender_address);
+    } else {
+        throw(error::invalid_operation());
+    }
+    
+    save_data();
+}
+
+
+
+;; Function to view contract balance
+int get_contract_balance() method_id {
+    [int balance, _] = get_balance();
+    return balance;
+}
+
+;; Getter method for logs
+(cell, int) get_logs() method_id {
+    load_data();
+    return (ctx_logs, ctx_log_count);
+}
+
+
+;; Getter method for user data
+(int, slice, slice, int, int, int, int, int, int) get_user_data(slice user_address) method_id {
+    load_data();
+    int user_key = address_to_uint256(user_address);
+    (slice user_data, int found?) = ctx_users.udict_get?(256, user_key);
+    throw_unless(error::user_not_found(), found?);
+    
+    slice stored_address = user_data~load_msg_addr();
+    slice upline = user_data~load_msg_addr();
+    int investment_plan = user_data~load_uint(2);
+    int total_invested = user_data~load_coins();
+    int total_withdrawn = user_data~load_coins();
+    int last_investment_time = user_data~load_uint(32);
+    int referral_earnings = user_data~load_coins();
+    int total_earnings = user_data~load_coins();
+    
+    return (found?, stored_address, upline, investment_plan, total_invested, total_withdrawn, last_investment_time, referral_earnings, total_earnings);
+}
+
+
+
+;; Getter method for effective plan details (including ROI multiplier)
+(int, int, int, int) get_effective_plan_details(int plan_id) method_id {
+    load_data();
+    (int daily_roi_basis_points, int min_investment, int duration, int withdrawal_fee) = get_plan_details(plan_id);
+    int effective_daily_roi = (daily_roi_basis_points * ctx_roi_multiplier) / BASIS_POINTS;
+    return (effective_daily_roi, min_investment, duration, withdrawal_fee);
+}
+
+
+;; Getter method for user's current ROI
+int get_current_roi(slice user_address) method_id {
+    load_data();
+    int user_key = address_to_uint256(user_address);
+    (slice user_data, int found?) = ctx_users.udict_get?(256, user_key);
+    throw_unless(error::user_not_found(), found?);
+
+    slice ds = user_data;
+    ds~load_msg_addr(); ;; skip stored_address
+    ds~load_msg_addr(); ;; skip upline
+    int current_plan = ds~load_uint(2);
+    int total_invested = ds~load_coins();
+    int total_withdrawn = ds~load_coins();
+    int last_investment_time = ds~load_uint(32);
+
+    int current_time = now();
+    int days_since_last_roi = (current_time - last_investment_time) / 86400;
+    
+    int daily_roi = calculate_daily_roi(current_plan, total_invested);
+    return daily_roi * days_since_last_roi;
+}
+
+
+
+;; Getter method for current ROI multiplier
+int get_roi_multiplier() method_id {
+    load_data();
+    return ctx_roi_multiplier;
+}
+
+
+;; Getter method for daily withdrawal limit status
+(int, int) get_daily_withdrawal_status() method_id {
+    load_data();
+    reset_daily_withdrawal();
+    return (ctx_daily_withdrawn, DAILY_WITHDRAWAL_LIMIT - ctx_daily_withdrawn);
+}
+
+
+;; Getter method for reinvestment status
+(int, int) get_reinvestment_status(slice user_address) method_id {
+    load_data();
+    int user_key = address_to_uint256(user_address);
+    (slice user_data, int found?) = ctx_users.udict_get?(256, user_key);
+    throw_unless(error::user_not_found(), found?);
+
+    slice ds = user_data;
+    ds~load_msg_addr(); ;; skip stored_address
+    ds~load_msg_addr(); ;; skip upline
+    ds~load_uint(2); ;; skip current_plan
+    int total_invested = ds~load_coins();
+    ds~load_coins(); ;; skip total_withdrawn
+    ds~load_uint(32); ;; skip last_investment_time
+    ds~load_coins(); ;; skip referral_earnings
+    int total_earnings = ds~load_coins();
+
+    int reinvestment_required = is_reinvestment_required(total_invested, total_earnings);
+    int earnings_percentage = (total_earnings * 100) / total_invested;
+    
+    return (reinvestment_required, earnings_percentage);
+}
+
+
+
+;; Getter method for next ROI halving information
+(int, int) get_next_roi_halving_info() method_id {
+    load_data();
+    return (ctx_next_halving_time, ctx_roi_multiplier);
+}
+
+
+;; Getter method for sustainability pool balance
+int get_sustainability_pool_balance() method_id {
+    load_data();
+    return ctx_sustainability_pool;
+}

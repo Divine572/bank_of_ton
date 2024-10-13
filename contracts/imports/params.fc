@@ -1,0 +1,37 @@
+;; Operation codes
+int op::deposit() asm "1000 PUSHINT";
+int op::register_user() asm "1002 PUSHINT";
+int op::update_config() asm "1003 PUSHINT";
+int op::update_admin() asm "1004 PUSHINT";
+int op::register_user() asm "1002 PUSHINT";
+int op::invest() asm "1004 PUSHINT";
+int op::distribute_roi() asm "1005 PUSHINT";
+int op::distribute_roi_all() asm "1006 PUSHINT";
+int op::halve_roi() asm "1007 PUSHINT";
+int op::withdraw() asm "1008 PUSHINT";
+int op::withdrawal_processed() asm "1009 PUSHINT";
+int op::reinvest() asm "1009 PUSHINT";
+int op::upgrade_contract() asm "1010 PUSHINT";
+
+
+;; Error codes
+int error::unauthorized() asm "401 PUSHINT";
+int error::invalid_amount() asm "403 PUSHINT";
+int error::invalid_operation() asm "404 PUSHINT";
+int error::user_already_registered() asm "405 PUSHINT";
+int error::invalid_upline() asm "406 PUSHINT";
+int error::user_not_found() asm "407 PUSHINT";
+int error::invalid_plan() asm "408 PUSHINT";
+int error::insufficient_investment() asm "409 PUSHINT";
+int error::insufficient_funds() asm "410 PUSHINT";
+int error::exceeds_daily_limit() asm "411 PUSHINT";
+int error::insufficient_balance() asm "412 PUSHINT";
+int error::withdrawal_too_early() asm "413 PUSHINT";
+
+
+
+
+;; Constants
+int const::min_deposit() asm "2 PUSHINT"; ;; 2 TON
+int const::max_deposit() asm "2000 PUSHINT"; ;; 2000 TON
+int const::daily_withdrawal_limit() asm "100 PUSHINT"; ;; 100 TON
